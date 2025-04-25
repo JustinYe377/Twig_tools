@@ -30,25 +30,26 @@ def write_packetlist(capwriter, pkt):
 
 ## super slow and bulky...
 def sniff_pcap(stop_threads, capfile, network):
-    capreader = PcapReader(capfile)
-    while not stop_threads.is_set():
-        try:
-            pkt = capreader.recv()
-            if IP in pkt and ipaddress.ip_address(pkt[IP].src) in network.network:
-                # don’t forward intra-PCAP traffic
-                if (ipaddress.ip_address(pkt[IP].src) in network.network and
-                    ipaddress.ip_address(pkt[IP].dst) in network.network):
-                    continue
-                if args.debug > 0:
-                    print("sending pkt", pkt.summary())
+	capreader = PcapReader(capfile)
+	while(not stop_threads.is_set()):
+		try:
+			## sniff a pkt from the capture file
+			pkt = capreader.recv()
+			if IP in pkt and ipaddress.ip_address(pkt[IP].src) in network.network:
+				## if from this network and to this network, dont move it outside the pcap.
+				if ipaddress.ip_address(pkt[IP].src) in network.network and ipaddress.ip_address(pkt[IP].dst) in network.network:
+					continue
+				if(args.debug >0):
+					print("sending pkt", pkt.summary())
 
-                # send on the shim’s interface so replies reach your ping
-                sendp(pkt, iface=args.iface, verbose=args.debug)
+				## write pkt out. specifying interface doesnt do anything.
+				# send(pkt.getlayer(IP), verbose=1, iface=args.iface)
+				send(pkt.getlayer(IP), verbose=args.debug)
 
-        except:
-            time.sleep(0.01)
-            pass
-
+		except:
+			# sleep for 10ms to prevent thrashing.
+			time.sleep(0.01)
+			pass
 
 
 def sighandler(signum, frame):

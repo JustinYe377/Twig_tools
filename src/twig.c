@@ -59,19 +59,23 @@ struct udp_hdr {
     uint16_t length;
     uint16_t checksum;
 };
-// Compute checksum for IP/ICMP/UDP
-static uint16_t checksum(void *vdata, size_t length) {
-    uint8_t *data = vdata;
+
+// Compute one's-complement checksum, return in network byte order
+static uint16_t checksum(const void *data, size_t length) {
+    const uint16_t *buf = data;
     uint32_t sum = 0;
     while (length > 1) {
-        sum += (data[0] << 8) | data[1];
-        data += 2;
+        sum += ntohs(*buf);
+        buf++;
         length -= 2;
     }
-    if (length == 1) sum += data[0] << 8;
-    sum = (sum >> 16) + (sum & 0xFFFF);
+    if (length == 1) {
+        sum += (*(const uint8_t*)buf) << 8;
+    }
+    // fold carry
+    sum = (sum & 0xFFFF) + (sum >> 16);
     sum += (sum >> 16);
-    return (uint16_t)(~sum);
+    return htons((uint16_t)~sum);
 }
 
 int main(int argc, char *argv[]) {
@@ -88,6 +92,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s -i <address_prefix>\n", argv[0]);
         return EXIT_FAILURE;
     }
+    // Parse A.B.C.D_P
     char addr_str[INET_ADDRSTRLEN];
     int prefix;
     if (sscanf(iface_spec, "%15[^_]_%d", addr_str, &prefix) != 2) {
@@ -119,7 +124,7 @@ int main(int argc, char *argv[]) {
         perror("open");
         return EXIT_FAILURE;
     }
-
+    // Skip global header
     struct pcap_file_header gh;
     if (read(fd_in, &gh, sizeof(gh)) != sizeof(gh)) {
         fprintf(stderr, "Failed to read global header\n");
@@ -134,75 +139,61 @@ int main(int argc, char *argv[]) {
     struct pcap_pkthdr ph;
     uint8_t buffer[MAX_PACKET_SIZE];
 
-    // Real-time follow: loop and wait for new packets
+    // Real-time follow loop
     while (1) {
         ssize_t rh = read(fd_in, &ph, sizeof(ph));
-        if (rh == 0) {
-            // No new header yet, sleep briefly
-            usleep(10000);
-            continue;
-        }
-        if (rh < 0) {
-            perror("read header");
-            break;
-        }
-        if (rh != sizeof(ph)) {
-            // Partial read, skip
-            continue;
-        }
+        if (rh == 0) { usleep(10000); continue; }
+        if (rh < 0) { perror("read"); break; }
+        if ((size_t)rh != sizeof(ph)) continue;
         uint32_t caplen = swap_endian ? ntohl(ph.caplen) : ph.caplen;
-        if (caplen > MAX_PACKET_SIZE) {
-            lseek(fd_in, caplen, SEEK_CUR);
-            continue;
-        }
-        ssize_t rd = read(fd_in, buffer, caplen);
-        if (rd < caplen) {
-            // Incomplete packet, skip
-            continue;
-        }
+        if (caplen > MAX_PACKET_SIZE) { lseek(fd_in, caplen, SEEK_CUR); continue; }
+        if (read(fd_in, buffer, caplen) != caplen) continue;
         // Parse Ethernet
         uint16_t ethertype = ntohs(*(uint16_t*)(buffer + 12));
         if (ethertype != 0x0800) continue;
+        // Parse IP
         struct ip_hdr *ip = (struct ip_hdr*)(buffer + ETHER_HDR_LEN);
         int iphlen = ip->ihl * 4;
         if (iphlen < sizeof(struct ip_hdr)) continue;
-        // ICMP
+
+        // ICMP echo request
         if (ip->protocol == 1) {
             struct icmp_hdr *icmp = (struct icmp_hdr*)(buffer + ETHER_HDR_LEN + iphlen);
-            if (icmp->type == 8) {
-                // Swap MACs
-                for (int i = 0; i < 6; i++) {
-                    uint8_t t = buffer[i]; buffer[i] = buffer[6+i]; buffer[6+i] = t;
-                }
-                // Swap IPs
-                uint32_t t_ip = ip->saddr; ip->saddr = ip->daddr; ip->daddr = t_ip;
-                // Reply
-                icmp->type = 0;
-                icmp->checksum = 0;
-                uint32_t icmplen = caplen - ETHER_HDR_LEN - iphlen;
-                icmp->checksum = checksum(icmp, icmplen);
-                ip->checksum = 0;
-                ip->checksum = checksum(ip, iphlen);
-                struct iovec iov[2] = {{&ph, sizeof(ph)}, {buffer, caplen}};
-                writev(fd_out, iov, 2);
-                fprintf(stderr, "[twig] Replied to ICMP echo request\n");
+            if (icmp->type != 8) continue;
+            // Swap MAC
+            for (int i = 0; i < 6; i++) {
+                uint8_t t = buffer[i]; buffer[i] = buffer[6+i]; buffer[6+i] = t;
             }
+            // Swap IPs
+            uint32_t tmp = ip->saddr; ip->saddr = ip->daddr; ip->daddr = tmp;
+            // Build reply
+            icmp->type = 0;
+            icmp->checksum = 0;
+            uint32_t icmplen = caplen - ETHER_HDR_LEN - iphlen;
+            icmp->checksum = checksum(icmp, icmplen);
+            // Recompute IP checksum
+            ip->checksum = 0;
+            ip->checksum = checksum(ip, iphlen);
+            // Append to PCAP
+            struct iovec iov[2] = {{&ph, sizeof(ph)}, {buffer, caplen}};
+            writev(fd_out, iov, 2);
+            fprintf(stderr, "[twig] Replied to ICMP echo request\n");
             continue;
         }
-        // UDP
+        // UDP handling
         if (ip->protocol == 17) {
             struct udp_hdr *udp = (struct udp_hdr*)(buffer + ETHER_HDR_LEN + iphlen);
-            uint16_t src_port = ntohs(udp->source);
-            uint16_t dst_port = ntohs(udp->dest);
-            // Echo (7)
-            if (dst_port == 7) {
+            uint16_t src = ntohs(udp->source), dst = ntohs(udp->dest);
+            uint32_t tmp;
+            // UDP echo (port 7)
+            if (dst == 7) {
                 for (int i = 0; i < 6; i++) {
                     uint8_t t = buffer[i]; buffer[i] = buffer[6+i]; buffer[6+i] = t;
                 }
-                uint32_t t_ip = ip->saddr; ip->saddr = ip->daddr; ip->daddr = t_ip;
+                tmp = ip->saddr; ip->saddr = ip->daddr; ip->daddr = tmp;
                 udp->source = htons(7);
-                udp->dest = htons(src_port);
-                uint32_t udplen = ntohs(udp->length);
+                udp->dest   = htons(src);
+                uint16_t udplen = ntohs(udp->length);
                 udp->checksum = 0;
                 udp->checksum = checksum(udp, udplen);
                 ip->tot_len = htons(iphlen + udplen);
@@ -213,29 +204,29 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "[twig] Replied to UDP echo\n");
                 continue;
             }
-            // Time (37)
-            if (dst_port == 37) {
+            // Time protocol (port 37)
+            if (dst == 37) {
                 for (int i = 0; i < 6; i++) {
                     uint8_t t = buffer[i]; buffer[i] = buffer[6+i]; buffer[6+i] = t;
                 }
-                uint32_t t_ip = ip->saddr; ip->saddr = ip->daddr; ip->daddr = t_ip;
+                tmp = ip->saddr; ip->saddr = ip->daddr; ip->daddr = tmp;
                 uint32_t ts1900 = htonl((uint32_t)(time(NULL) + 2208988800U));
                 struct udp_hdr *u2 = (struct udp_hdr*)(buffer + ETHER_HDR_LEN + iphlen);
                 u2->source = htons(37);
-                u2->dest = htons(src_port);
-                uint16_t newudplen = sizeof(*u2) + sizeof(ts1900);
-                u2->length = htons(newudplen);
-                memcpy((uint8_t*)(u2 + 1), &ts1900, sizeof(ts1900));
+                u2->dest   = htons(src);
+                uint16_t newlen = sizeof(*u2) + sizeof(ts1900);
+                u2->length = htons(newlen);
+                memcpy(u2 + 1, &ts1900, sizeof(ts1900));
                 u2->checksum = 0;
-                u2->checksum = checksum(u2, newudplen);
-                ip->tot_len = htons(iphlen + newudplen);
+                u2->checksum = checksum(u2, newlen);
+                ip->tot_len = htons(iphlen + newlen);
                 ip->checksum = 0;
                 ip->checksum = checksum(ip, iphlen);
                 struct pcap_pkthdr ph2 = ph;
-                uint32_t newcap = ETHER_HDR_LEN + iphlen + newudplen;
-                if (swap_endian) ph2.caplen = ph2.len = htonl(newcap);
-                else ph2.caplen = ph2.len = newcap;
-                struct iovec iov[2] = {{&ph2, sizeof(ph2)}, {buffer, newcap}};
+                uint32_t cap2 = ETHER_HDR_LEN + iphlen + newlen;
+                if (swap_endian) ph2.caplen = ph2.len = htonl(cap2);
+                else ph2.caplen = ph2.len = cap2;
+                struct iovec iov[2] = {{&ph2, sizeof(ph2)}, {buffer, cap2}};
                 writev(fd_out, iov, 2);
                 fprintf(stderr, "[twig] Replied to Time request\n");
                 continue;
@@ -246,4 +237,3 @@ int main(int argc, char *argv[]) {
     close(fd_out);
     return EXIT_SUCCESS;
 }
-
